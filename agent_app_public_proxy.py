@@ -8,7 +8,7 @@ Environment variables (all required unless noted):
   DATABRICKS_HOST    Workspace URL, e.g. https://dbc-xxxx.cloud.databricks.com
   SP_CLIENT_ID       Service principal application_id (OAuth client id)
   SP_CLIENT_SECRET   Service principal OAuth secret
-  PROXY_API_KEY      Optional. If set, callers must send header X-API-Key with this value.
+  PROXY_API_KEY      Optional passcode. Browsers get a login page; API clients send X-API-Key.
 
 Run locally:
   pip install -r requirements.txt
@@ -27,7 +27,8 @@ from collections import defaultdict, deque
 
 import httpx
 from fastapi import FastAPI, Request
-from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, StreamingResponse
+from urllib.parse import parse_qs
 
 APP_URL = os.environ["APP_URL"].rstrip("/")
 DATABRICKS_HOST = os.environ["DATABRICKS_HOST"].rstrip("/")
@@ -78,6 +79,47 @@ def rate_limited(client_ip: str) -> bool:
     return False
 
 
+# ---------- passcode login (browsers cannot send X-API-Key headers) ----------
+LOGIN_PAGE = """<!doctype html>
+<html><head><title>Agent App</title></head>
+<body style="font-family:sans-serif;display:flex;justify-content:center;align-items:center;height:100vh;margin:0;background:#f5f5f5;">
+  <form method="post" action="/__proxy_login" style="background:#fff;padding:2rem;border-radius:8px;box-shadow:0 2px 8px rgba(0,0,0,.15);">
+    <h2 style="margin-top:0;">Agent App</h2>
+    <p>Enter the access passcode to continue.</p>
+    <input type="password" name="passcode" placeholder="Passcode" required
+           style="width:100%;padding:.5rem;margin:.5rem 0;box-sizing:border-box;">
+    <p style="color:#c00;margin:0;"><!--ERROR--></p>
+    <button type="submit" style="width:100%;padding:.5rem;margin-top:.5rem;">Enter</button>
+  </form>
+</body></html>"""
+
+
+def _authorized(request: Request) -> bool:
+    if not PROXY_API_KEY:
+        return True  # open access (rate limiting still applies)
+    if request.headers.get("x-api-key") == PROXY_API_KEY:
+        return True
+    if request.cookies.get("proxy_key") == PROXY_API_KEY:
+        return True
+    return False
+
+
+@app.get("/__proxy_login")
+async def login_form():
+    return HTMLResponse(LOGIN_PAGE)
+
+
+@app.post("/__proxy_login")
+async def login_submit(request: Request):
+    body = (await request.body()).decode("utf-8", "replace")
+    passcode = parse_qs(body).get("passcode", [""])[0]
+    if passcode == PROXY_API_KEY:
+        resp = RedirectResponse("/", status_code=303)
+        resp.set_cookie("proxy_key", PROXY_API_KEY, httponly=True, samesite="lax", max_age=7 * 86400)
+        return resp
+    return HTMLResponse(LOGIN_PAGE.replace("<!--ERROR-->", "Wrong passcode — try again."), status_code=401)
+
+
 # ---------- transparent reverse proxy ----------
 HOP_BY_HOP = {"connection", "keep-alive", "proxy-authenticate", "proxy-authorization",
               "te", "trailers", "transfer-encoding", "upgrade", "host", "authorization"}
@@ -89,9 +131,14 @@ http = httpx.AsyncClient(timeout=httpx.Timeout(300, connect=15))  # long timeout
 async def proxy(path: str, request: Request):
     client_ip = request.client.host if request.client else "unknown"
 
-    # Optional API-key gate for public users
-    if PROXY_API_KEY and request.headers.get("x-api-key") != PROXY_API_KEY:
-        return JSONResponse({"error": "invalid or missing X-API-Key"}, status_code=401)
+    # Auth gate: X-API-Key header (API clients) or passcode cookie (browsers)
+    if not _authorized(request):
+        if request.method in ("GET", "HEAD"):
+            return HTMLResponse(LOGIN_PAGE, status_code=401)
+        return JSONResponse(
+            {"error": "unauthorized; send X-API-Key or log in via /__proxy_login"},
+            status_code=401,
+        )
 
     if rate_limited(client_ip):
         return JSONResponse({"error": "rate limit exceeded, slow down"}, status_code=429)
