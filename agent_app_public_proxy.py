@@ -30,6 +30,14 @@ from fastapi import FastAPI, Request
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, StreamingResponse
 from urllib.parse import parse_qs
 
+REQUIRED_ENV_VARS = ["APP_URL", "DATABRICKS_HOST", "SP_CLIENT_ID", "SP_CLIENT_SECRET"]
+_missing = [v for v in REQUIRED_ENV_VARS if not os.environ.get(v)]
+if _missing:
+    raise RuntimeError(
+        "Missing required environment variables: " + ", ".join(_missing)
+        + ". Set them in your host's dashboard (e.g. Render > Environment) and redeploy."
+    )
+
 APP_URL = os.environ["APP_URL"].rstrip("/")
 DATABRICKS_HOST = os.environ["DATABRICKS_HOST"].rstrip("/")
 SP_CLIENT_ID = os.environ["SP_CLIENT_ID"]
@@ -120,6 +128,27 @@ async def login_submit(request: Request):
     return HTMLResponse(LOGIN_PAGE.replace("<!--ERROR-->", "Wrong passcode — try again."), status_code=401)
 
 
+@app.get("/__proxy_health")
+async def health(request: Request):
+    """Diagnostics: reports whether the Databricks token flow works and why not."""
+    if not _authorized(request):
+        return HTMLResponse(LOGIN_PAGE, status_code=401)
+    try:
+        token = get_access_token()
+        return JSONResponse({"status": "ok", "detail": "Databricks token fetched successfully"})
+    except httpx.HTTPStatusError as e:
+        return JSONResponse(
+            {"status": "error", "step": "token",
+             "http_status": e.response.status_code, "detail": e.response.text[:500]},
+            status_code=502,
+        )
+    except Exception as e:
+        return JSONResponse(
+            {"status": "error", "step": "token", "detail": f"{type(e).__name__}: {e}"},
+            status_code=502,
+        )
+
+
 # ---------- transparent reverse proxy ----------
 HOP_BY_HOP = {"connection", "keep-alive", "proxy-authenticate", "proxy-authorization",
               "te", "trailers", "transfer-encoding", "upgrade", "host", "authorization"}
@@ -129,6 +158,13 @@ http = httpx.AsyncClient(timeout=httpx.Timeout(300, connect=15))  # long timeout
 
 @app.api_route("/{path:path}", methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS", "HEAD"])
 async def proxy(path: str, request: Request):
+    try:
+        return await _do_proxy(path, request)
+    except Exception as e:
+        return JSONResponse({"proxy_error": f"{type(e).__name__}: {e}"}, status_code=500)
+
+
+async def _do_proxy(path: str, request: Request):
     client_ip = request.client.host if request.client else "unknown"
 
     # Auth gate: X-API-Key header (API clients) or passcode cookie (browsers)
@@ -148,16 +184,35 @@ async def proxy(path: str, request: Request):
     if request.url.query:
         upstream_url += f"?{request.url.query}"
     headers = {k: v for k, v in request.headers.items() if k.lower() not in HOP_BY_HOP}
-    headers["authorization"] = f"Bearer {get_access_token()}"
+    try:
+        token = get_access_token()
+    except httpx.HTTPStatusError as e:
+        return JSONResponse(
+            {"error": f"Databricks rejected the service principal credentials: HTTP {e.response.status_code} {e.response.text[:300]}"},
+            status_code=502,
+        )
+    except httpx.HTTPError as e:
+        return JSONResponse(
+            {"error": f"could not reach the Databricks token endpoint: {type(e).__name__}: {e}"},
+            status_code=502,
+        )
+    headers["authorization"] = f"Bearer {token}"
 
     body = await request.body()
     if not body:
         body = None
 
-    upstream = await http.build_request(request.method, upstream_url, headers=headers, content=body)
-    upstream_resp = await http.send(upstream, stream=True)
+    try:
+        upstream = http.build_request(request.method, upstream_url, headers=headers, content=body)
+        upstream_resp = await http.send(upstream, stream=True)
+    except httpx.HTTPError as e:
+        return JSONResponse(
+            {"error": f"could not reach the Databricks app: {type(e).__name__}: {e}"},
+            status_code=502,
+        )
 
-    resp_headers = [(k, v) for k, v in upstream_resp.headers.items() if k.lower() not in HOP_BY_HOP]
+    resp_headers = {k: v for k, v in upstream_resp.headers.items() if k.lower() not in HOP_BY_HOP}
+    resp_headers["x-proxy-upstream-status"] = str(upstream_resp.status_code)
     return StreamingResponse(
         upstream_resp.aiter_raw(),
         status_code=upstream_resp.status_code,
